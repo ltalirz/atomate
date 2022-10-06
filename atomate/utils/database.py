@@ -3,7 +3,9 @@ This module defines a base class for derived database classes that store calcula
 """
 
 import datetime
+import os
 from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass, field, asdict
 
 from maggma.stores import MongoStore, MongoURIStore, S3Store
 from monty.json import jsanitize
@@ -19,19 +21,59 @@ __email__ = "kmathew@lbl.gov"
 
 logger = get_logger(__name__)
 
+@dataclass
+class DbConfigFile:
+    """Represents db.json configuration file
+    """
+    host: str = None
+    port: int = None
+    database: str = None
+    collection: str = ""
+    host_uri: str = None
+    maggma_store: dict = field(default_factory=dict)
+    maggma_store_prefix: str = "atomate"
+    mongoclient_kwargs: dict = field(default_factory=dict)
+    admin_user: str = None
+    admin_password: str = None
+    readonly_user: str = None
+    readonly_password: str = None
+    authsource: str = None
+
+@dataclass
+class DbConfig:
+    """Represents CalcDb configuration
+    
+    Note: order of fields needs to mirror CalcDb.__init__ documentation. Should work for python 3.7+
+    """
+    host: str = None
+    port: int = None
+    database: str = None
+    collection: str = None
+    user: str = None
+    password: str = None
+    host_uri: str = None
+    maggma_store_prefix: str = "atomate"
+    maggma_store_kwargs: dict = field(default_factory=dict)
+    authsource: str = None
+
+
+def update_from_env(instance:dataclass, prefix:str):
+    """
+    update a dataclass instance from environment variables
+
+    environment variables, if set, take precedence.
+    """
+    #assert isinstance(instance, dataclass)
+    for k in instance.__dataclass_fields__:
+        env_key = prefix + k.upper()
+        if env_key in os.environ:
+            setattr(instance, k, os.environ[env_key])
+    return instance
 
 class CalcDb(metaclass=ABCMeta):
     def __init__(
         self,
-        host: str = None,
-        port: int = None,
-        database: str = None,
-        collection: str = None,
-        user: str = None,
-        password: str = None,
-        host_uri: str = None,
-        maggma_store_kwargs: dict = None,
-        maggma_store_prefix: str = "atomate",
+        *args,
         **kwargs,
     ):
         """
@@ -60,19 +102,17 @@ class CalcDb(metaclass=ABCMeta):
 
             **kwargs:
         """
-        if maggma_store_kwargs is None:
-            maggma_store_kwargs = {}
-        self.maggma_store_prefix = maggma_store_prefix
-        self.host = host
-        self.db_name = database
-        self.user = user
-        self.password = password
-        self.port = int(port) if port is not None else None
-        self.host_uri = host_uri
+        kwargs_unknown = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k not in DbConfig.__dataclass_fields__}
+        cfg = update_from_env(DbConfig(*args, **kwargs), prefix="ATOMATE_")
 
-        self._maggma_store_kwargs = (
-            maggma_store_kwargs if maggma_store_kwargs is not None else {}
-        )
+        self.maggma_store_prefix = cfg.maggma_store_prefix
+        self._maggma_store_kwargs = cfg.maggma_store_kwargs
+        self.host = cfg.host
+        self.db_name = cfg.database
+        self.user = cfg.user
+        self.password = cfg.password
+        self.port = cfg.port
+        self.host_uri = cfg.host_uri
 
         self._maggma_store_type = None
         if "bucket" in self._maggma_store_kwargs:
@@ -81,8 +121,8 @@ class CalcDb(metaclass=ABCMeta):
 
         self._maggma_stores = {}
 
-        if host_uri is not None:
-            dd_uri = parse_uri(host_uri)
+        if cfg.host_uri is not None:
+            dd_uri = parse_uri(cfg.host_uri)
             if dd_uri["database"] is not None:
                 self.db_name = dd_uri["database"]
             else:
@@ -96,19 +136,20 @@ class CalcDb(metaclass=ABCMeta):
                 raise Exception
         else:
             try:
+
                 self.connection = MongoClient(
                     host=self.host,
                     port=self.port,
                     username=self.user,
                     password=self.password,
-                    **kwargs,
+                    **kwargs_unknown,
                 )
                 self.db = self.connection[self.db_name]
             except Exception:
                 logger.error("Mongodb connection failed")
                 raise Exception
 
-        self.collection = self.db[collection]
+        self.collection = self.db[cfg.collection]
 
         # set counter collection
         if self.db.counter.count_documents({"_id": "taskid"}) == 0:
@@ -177,25 +218,21 @@ class CalcDb(metaclass=ABCMeta):
             MMDb object
         """
         creds = loadfn(db_file)
+        cfg = DbConfigFile(**creds)
 
-        maggma_kwargs = creds.get("maggma_store", {})
-        maggma_prefix = creds.get("maggma_store_prefix", "atomate")
-        database = creds.get("database", None)
+        kwargs = cfg.mongoclient_kwargs
 
-        kwargs = creds.get(
-            "mongoclient_kwargs", {}
-        )  # any other MongoClient kwargs can go here ...
-        if "host_uri" in creds:
+        if cfg.host_uri:
             return cls(
-                host_uri=creds["host_uri"],
-                database=database,
-                collection=creds["collection"],
-                maggma_store_kwargs=maggma_kwargs,
-                maggma_store_prefix=maggma_prefix,
+                host_uri=cfg.host_uri,
+                database=cfg.database,
+                collection=cfg.collection,
+                maggma_store_kwargs=cfg.maggma_store,
+                maggma_store_prefix=cfg.maggma_store_prefix,
                 **kwargs,
             )
 
-        if admin and "admin_user" not in creds and "readonly_user" in creds:
+        if admin and not cfg.admin_user and cfg.readonly_user:
             raise ValueError(
                 "Trying to use admin credentials, "
                 "but no admin credentials are defined. "
@@ -204,26 +241,26 @@ class CalcDb(metaclass=ABCMeta):
             )
 
         if admin:
-            user = creds.get("admin_user", "")
-            password = creds.get("admin_password", "")
+            user = cfg.admin_user
+            password = cfg.admin_password
         else:
-            user = creds.get("readonly_user", "")
-            password = creds.get("readonly_password", "")
+            user = cfg.readonly_user
+            password = cfg.readonly_password
 
         if "authsource" in creds:
-            kwargs["authsource"] = creds["authsource"]
+            kwargs["authsource"] = cfg.authsource
         else:
-            kwargs["authsource"] = creds["database"]
+            kwargs["authsource"] = cfg.database
 
         return cls(
-            host=creds["host"],
-            port=int(creds.get("port", 27017)),
-            database=creds["database"],
-            collection=creds["collection"],
+            host=cfg.host,
+            port=cfg.port,
+            database=cfg.database,
+            collection=cfg.collection,
             user=user,
             password=password,
-            maggma_store_kwargs=maggma_kwargs,
-            maggma_store_prefix=maggma_prefix,
+            maggma_store_kwargs=cfg.maggma_store,
+            maggma_store_prefix=cfg.maggma_store_prefix,
             **kwargs,
         )
 

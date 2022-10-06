@@ -26,6 +26,15 @@ class TestToDb(CalcDb):
     def reset(self):
         pass
 
+class DatabaseEnvTests(unittest.TestCase):
+
+    def test_from_env(self):
+        os.environ["ATOMATE_HOST"] = "localhost"
+        os.environ["ATOMATE_DATABASE"] = "test_db"
+        os.environ["ATOMATE_COLLECTION"] = "test_collection"
+        db = TestToDb()
+
+        self.assertEqual(db.db_name, "test_db")
 
 class DatabaseTests(unittest.TestCase):
     @classmethod
